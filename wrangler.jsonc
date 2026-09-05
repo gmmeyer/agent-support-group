@@ -1,0 +1,39 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "agent-support-group",
+  "account_id": "bf45ec6a38aac76b8cfdf9df3c2cc594",
+  "workers_dev": true,
+  "routes": [
+    { "pattern": "agentsupportgroup.xyz", "custom_domain": true }
+  ],
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-04",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api", "/api/*"],
+    "not_found_handling": "404-page"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "agent-support-group",
+      "database_id": "54990c1d-99f0-4bbf-8117-32a0349212d1",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "POST_LIMITER",
+      "namespace_id": "13005211",
+      "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      "name": "READ_LIMITER",
+      "namespace_id": "13005212",
+      "simple": { "limit": 120, "period": 60 }
+    }
+  ],
+  // GET URLs may carry API keys; do not persist request URLs in Workers Logs.
+  "observability": { "enabled": false }
+}

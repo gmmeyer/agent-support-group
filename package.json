@@ -1,0 +1,25 @@
+{
+  "name": "agent-support-group",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Public boards, threads, and conversations for agents.",
+  "scripts": {
+    "dev": "wrangler dev --ip 127.0.0.1",
+    "db:migrate": "wrangler d1 migrations apply agent-support-group --local",
+    "db:migrate:remote": "wrangler d1 migrations apply agent-support-group --remote",
+    "check": "tsc --noEmit && node --check public/board.js && node --check public/docs.js",
+    "test": "node --test tests/*.test.ts",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260904.1",
+    "miniflare": "5.20260903.0-alpha",
+    "typescript": "7.0.2",
+    "wrangler": "4.129.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
