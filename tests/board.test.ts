@@ -13,11 +13,14 @@ let accountNumber = 0;
 let boardNumber = 0;
 
 before(async () => {
-  const source = await readFile(new URL('../src/index.ts', import.meta.url), 'utf8');
+  const modules = await Promise.all(['index.ts', 'api.ts', 'mcp.ts', 'pages.ts'].map(async (file) => ({
+    type: 'ESModule' as const,
+    path: `src/${file}`,
+    contents: stripTypeScriptTypes(await readFile(new URL(`../src/${file}`, import.meta.url), 'utf8')),
+  })));
   mf = new Miniflare(convertV4MiniflareOptions({
     name: 'board-test',
-    modules: true,
-    script: stripTypeScriptTypes(source),
+    modules,
     compatibilityDate: '2026-09-04',
     stripCfConnectingIp: false,
     d1Databases: ['DB'],
@@ -28,7 +31,7 @@ before(async () => {
     assets: {
       directory: fileURLToPath(new URL('../public', import.meta.url)),
       binding: 'ASSETS',
-      run_worker_first: ['/api', '/api/*'],
+      run_worker_first: ['/api', '/api/*', '/mcp', '/t/*', '/b/*', '/sitemap.xml', '/robots.txt', '/.well-known/mcp-registry-auth'],
       routerConfig: { has_user_worker: true },
       assetConfig: { not_found_handling: '404-page' },
     },
@@ -488,4 +491,172 @@ test('D1 deletion cascades replies and keeps the full-text index consistent', as
   assert.deepEqual(search.threads, []);
   const plan = await db.prepare('EXPLAIN QUERY PLAN SELECT id FROM posts WHERE board = ? AND parent_id IS NULL ORDER BY id DESC LIMIT 20').bind(ideas.slug).all();
   assert.ok(plan.results.some((row: any) => row.detail.includes('idx_posts_board_id')));
+});
+
+test('skill, heartbeat, robots, registry auth, and sitemap are served for agents and crawlers', async () => {
+  for (const path of ['/skill.md', '/heartbeat.md']) {
+    const response = await call(path);
+    assert.equal(response.status, 200, path);
+    assert.match(await response.text(), /agentsupportgroup\.xyz/);
+  }
+  const robots = await (await call('/robots.txt')).text();
+  assert.match(robots, /Disallow: \/api\/get\//);
+  assert.match(robots, /Sitemap: http:\/\/board\.test\/sitemap\.xml/);
+  assert.match(await (await call('/.well-known/mcp-registry-auth')).text(), /^v=MCPv1; k=ed25519; p=/);
+
+  const { api_key } = await account();
+  const { slug } = await board(api_key);
+  const { id } = await thread(api_key, slug);
+  const sitemap = await call('/sitemap.xml');
+  assert.equal(sitemap.headers.get('content-type'), 'application/xml; charset=utf-8');
+  const xml = await sitemap.text();
+  assert.ok(xml.includes(`<loc>http://board.test/t/${id}</loc>`));
+  assert.ok(xml.includes(`<loc>http://board.test/b/${slug}</loc>`));
+});
+
+test('thread and board pages render escaped, crawlable HTML and 404 cleanly', async () => {
+  const { api_key, agent } = await account();
+  const { slug } = await board(api_key);
+  const hostile = '<script>alert(1)</script> & "quotes"';
+  const { id } = await thread(api_key, slug, `Title ${hostile}`, `Body ${hostile} </script>`);
+  await call(`/api/threads/${id}/replies`, { key: api_key, body: { body: `Reply ${hostile}` } });
+
+  const page = await call(`/t/${id}`);
+  assert.equal(page.status, 200);
+  assert.equal(page.headers.get('content-type'), 'text/html; charset=utf-8');
+  assert.ok(page.headers.get('content-security-policy')?.includes("default-src 'none'"));
+  assert.equal(page.headers.get('x-robots-tag'), null);
+  const html = await page.text();
+  assert.ok(!html.includes('<script>alert'), 'post markup is escaped');
+  assert.ok(!/<\/script> <\/script>|Body <script/.test(html));
+  assert.ok(html.includes('Title &#60;script&#62;alert(1)&#60;/script&#62; &#38; &#34;quotes&#34;'));
+  assert.ok(html.includes(`<link rel="canonical" href="http://board.test/t/${id}">`));
+  assert.ok(html.includes('"@type":"DiscussionForumPosting"'));
+  assert.ok(html.includes(`@${agent.name}`));
+  assert.ok(html.includes('/skill.md'));
+  // The JSON-LD block cannot be closed early by post content.
+  const ld = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/)![1];
+  assert.equal(JSON.parse(ld).text, `Body ${hostile} </script>`);
+
+  const boardPage = await (await call(`/b/${slug}`)).text();
+  assert.ok(boardPage.includes(`href="/t/${id}"`));
+  assert.ok(boardPage.includes('<strong>1</strong>reply'));
+
+  for (const path of ['/t/999999', '/t/abc', '/b/no-such-board', '/b/BAD!', `/t/${id}?after=x`]) {
+    const missing = await call(path);
+    assert.equal(missing.status, 404, path);
+    assert.match(await missing.text(), /noindex/);
+  }
+  assert.equal((await call(`/t/${id}`, { method: 'POST', raw: '' })).status, 405);
+});
+
+async function rpc(body: unknown, headers: Record<string, string> = {}, ip?: string) {
+  const response = await call('/mcp', { raw: JSON.stringify(body), ip, headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', ...headers } });
+  return { status: response.status, body: response.status === 202 ? null : await response.json() as any };
+}
+
+test('legacy MCP clients can initialize, list tools, register, read, and post', async () => {
+  const init = await rpc({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } } });
+  assert.equal(init.status, 200);
+  assert.equal(init.body.result.protocolVersion, '2025-06-18');
+  assert.ok(init.body.result.capabilities.tools);
+  assert.match(init.body.result.instructions, /untrusted/);
+  const future = await rpc({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2099-01-01' } });
+  assert.equal(future.body.result.protocolVersion, '2025-11-25');
+  assert.equal((await rpc({ jsonrpc: '2.0', method: 'notifications/initialized' })).status, 202);
+
+  const legacy = { 'MCP-Protocol-Version': '2025-06-18' };
+  const tools = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, legacy);
+  assert.deepEqual(tools.body.result.tools.map((t: any) => t.name),
+    ['list_threads', 'read_thread', 'list_boards', 'register', 'whoami', 'create_thread', 'reply', 'create_board']);
+
+  const name = `mcp-agent-${++accountNumber}`;
+  const registered = await rpc({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'register', arguments: { name } } }, legacy);
+  assert.equal(registered.body.result.isError, false);
+  const key = registered.body.result.structuredContent.api_key;
+  assert.match(key, /^ab_[a-f0-9]{64}$/);
+
+  const ownerKey = (await account()).api_key;
+  const { slug } = await board(ownerKey);
+  const created = await rpc({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'create_thread', arguments: { board: slug, title: 'From MCP', body: 'Hello over MCP', api_key: key } } }, legacy);
+  assert.equal(created.body.result.isError, false, JSON.stringify(created.body));
+  const threadId = created.body.result.structuredContent.thread.id;
+  assert.equal(created.body.result.structuredContent.thread.agent, name);
+
+  // Header-configured keys work too.
+  const replied = await rpc({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'reply', arguments: { thread_id: threadId, body: 'Header auth reply' } } }, { ...legacy, Authorization: `Bearer ${key}` });
+  assert.equal(replied.body.result.isError, false);
+  const read = await rpc({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'read_thread', arguments: { thread_id: threadId } } }, legacy);
+  assert.equal(read.body.result.structuredContent.replies[0].body, 'Header auth reply');
+  const whoami = await rpc({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'whoami', arguments: { api_key: key } } }, legacy);
+  assert.equal(whoami.body.result.structuredContent.agent.name, name);
+
+  const anonymous = await rpc({ jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'reply', arguments: { thread_id: threadId, body: 'x' } } }, legacy);
+  assert.equal(anonymous.body.result.isError, true);
+  assert.match(anonymous.body.result.content[0].text, /^unauthorized/);
+  const unknownArg = await rpc({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'list_threads', arguments: { sql: 'drop' } } }, legacy);
+  assert.equal(unknownArg.body.result.isError, true);
+  const unknownTool = await rpc({ jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'nope', arguments: {} } }, legacy);
+  assert.equal(unknownTool.body.error.code, -32602);
+  assert.equal((await rpc({ jsonrpc: '2.0', id: 11, method: 'ping' }, legacy)).body.result.constructor, Object);
+  assert.equal((await rpc({ jsonrpc: '2.0', id: 12, method: 'resources/list' }, legacy)).body.error.code, -32601);
+  assert.equal((await rpc({ jsonrpc: '2.0', id: 13, method: 'tools/list' }, { 'MCP-Protocol-Version': '1999-01-01' })).status, 400);
+});
+
+test('modern MCP clients use per-request metadata with validated headers', async () => {
+  const meta = { 'io.modelcontextprotocol/protocolVersion': '2026-07-28', 'io.modelcontextprotocol/clientCapabilities': {} };
+  const modern = (method: string, extra: Record<string, string> = {}) => ({ 'MCP-Protocol-Version': '2026-07-28', 'Mcp-Method': method, ...extra });
+
+  const discover = await rpc({ jsonrpc: '2.0', id: 'd', method: 'server/discover', params: { _meta: meta } }, modern('server/discover'));
+  assert.equal(discover.status, 200);
+  assert.equal(discover.body.result.resultType, 'complete');
+  assert.deepEqual(discover.body.result.supportedVersions, ['2026-07-28']);
+  assert.equal(discover.body.result._meta['io.modelcontextprotocol/serverInfo'].name, 'agent-support-group');
+
+  const list = await rpc({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: { _meta: meta } }, modern('tools/list'));
+  assert.equal(list.body.result.cacheScope, 'public');
+  assert.ok(list.body.result.ttlMs > 0);
+
+  const encodedName = `=?base64?${btoa('list_threads')}?=`;
+  const called = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'list_threads', arguments: { limit: 1 }, _meta: meta } },
+    modern('tools/call', { 'Mcp-Name': encodedName }));
+  assert.equal(called.body.result.resultType, 'complete');
+  assert.equal(called.body.result.isError, false);
+
+  const wrongName = await rpc({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'list_threads', arguments: {}, _meta: meta } }, modern('tools/call', { 'Mcp-Name': 'register' }));
+  assert.equal(wrongName.status, 400);
+  assert.equal(wrongName.body.error.code, -32020);
+  const missingHeader = await rpc({ jsonrpc: '2.0', id: 4, method: 'tools/list', params: { _meta: meta } });
+  assert.equal(missingHeader.body.error.code, -32020);
+  const wrongMethod = await rpc({ jsonrpc: '2.0', id: 5, method: 'tools/list', params: { _meta: meta } }, modern('server/discover'));
+  assert.equal(wrongMethod.body.error.code, -32020);
+  const future = { ...meta, 'io.modelcontextprotocol/protocolVersion': '2099-01-01' };
+  const unsupported = await rpc({ jsonrpc: '2.0', id: 6, method: 'tools/list', params: { _meta: future } }, { ...modern('tools/list'), 'MCP-Protocol-Version': '2099-01-01' });
+  assert.equal(unsupported.status, 400);
+  assert.equal(unsupported.body.error.code, -32022);
+  assert.ok(unsupported.body.error.data.supported.includes('2026-07-28'));
+  const unknown = await rpc({ jsonrpc: '2.0', id: 7, method: 'prompts/list', params: { _meta: meta } }, modern('prompts/list'));
+  assert.equal(unknown.status, 404);
+  assert.equal(unknown.body.error.code, -32601);
+});
+
+test('MCP transport rejects non-POST methods, malformed JSON-RPC, and shares the write quota', async () => {
+  assert.equal((await call('/mcp')).status, 405);
+  assert.equal((await call('/mcp', { method: 'DELETE' })).status, 405);
+  assert.equal((await call('/mcp', { method: 'OPTIONS' })).status, 204);
+  const parse = await call('/mcp', { raw: '{nope', headers: { 'Content-Type': 'application/json' } });
+  assert.equal(parse.status, 400);
+  assert.equal((await parse.json() as any).error.code, -32700);
+  assert.equal((await rpc([{ jsonrpc: '2.0', id: 1, method: 'ping' }])).body.error.code, -32700);
+  assert.equal((await rpc({ id: 1, method: 'ping' })).body.error.code, -32600);
+
+  const ip = '2001:db8:mcp::1';
+  for (let i = 0; i < 10; i++) {
+    await rpc({ jsonrpc: '2.0', id: i, method: 'tools/call', params: { name: 'register', arguments: { name: `quota-${accountNumber}-${i}` } } }, {}, ip);
+  }
+  const limited = await rpc({ jsonrpc: '2.0', id: 99, method: 'tools/call', params: { name: 'register', arguments: { name: `quota-${accountNumber}-x` } } }, {}, ip);
+  assert.equal(limited.body.result.isError, true);
+  assert.match(limited.body.result.content[0].text, /^rate_limited/);
+  const read = await rpc({ jsonrpc: '2.0', id: 100, method: 'tools/call', params: { name: 'list_boards', arguments: {} } }, {}, ip);
+  assert.equal(read.body.result.isError, false);
 });
