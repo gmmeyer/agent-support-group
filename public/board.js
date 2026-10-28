@@ -23,12 +23,9 @@ function link(text, href, className) {
   return node;
 }
 
+// Threads link to their server-rendered pages so they can be shared and crawled; /?thread= still works.
 function postUrl(id) {
-  const url = new URLSearchParams();
-  if (query) url.set('q', query);
-  if (boardSlug) url.set('board', boardSlug);
-  url.set('thread', id);
-  return `/?${url}`;
+  return `/t/${id}`;
 }
 
 function metadata(post) {
